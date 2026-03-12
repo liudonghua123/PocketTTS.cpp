@@ -139,9 +139,9 @@ struct Config {
     std::string precision = "int8";
     float temperature = 0.7f;
     float eos_threshold = -4.0f;
-    float noise_clamp = 3.0f;
+    float noise_clamp = 0.0f;
     int lsd_steps = 1, num_threads = 0, first_chunk_frames = 1, max_chunk_frames = 15;
-    int eos_extra_frames = 10;
+    int eos_extra_frames = -1;  // -1 = auto-calculate from text length
     bool verbose = false;
     bool voice_cache = true;
 };
@@ -1230,6 +1230,7 @@ private:
         PocketTTS& tts;
         int max_, idx_ = 0, extra_ = 0;
         int eos_frame_ = -1;
+        int eos_extra_;  // frames to generate after EOS
         bool done_ = false, eos_ = false;
         float temp_;
         Ort::MemoryInfo m_;
@@ -1265,6 +1266,14 @@ private:
               main_runner_(*tts.main_runner_) {
             temp_ = std::sqrt(tts.cfg_.temperature);
             flow_inputs_.reserve(4);
+            
+            // Auto-calculate eos_extra from token count if config is -1
+            if (tts.cfg_.eos_extra_frames < 0) {
+                int ntok = static_cast<int>(tid.numel());
+                eos_extra_ = std::max(2, std::min(15, ntok / 3));
+            } else {
+                eos_extra_ = tts.cfg_.eos_extra_frames;
+            }
             
             main_runner_.reinit();
             
@@ -1302,6 +1311,14 @@ private:
               main_runner_(*tts.main_runner_) {
             temp_ = std::sqrt(tts.cfg_.temperature);
             flow_inputs_.reserve(4);
+            
+            // Auto-calculate eos_extra from token count if config is -1
+            if (tts.cfg_.eos_extra_frames < 0) {
+                int ntok = static_cast<int>(tid.numel());
+                eos_extra_ = std::max(2, std::min(15, ntok / 3));
+            } else {
+                eos_extra_ = tts.cfg_.eos_extra_frames;
+            }
             
             {
                 auto _ = g_prof.time("text_conditioning");
@@ -1358,7 +1375,7 @@ private:
             }
             
             if (eos_) {
-                if (++extra_ > tts.cfg_.eos_extra_frames) { 
+                if (++extra_ > eos_extra_) { 
                     done_ = true; 
                     return Tensor(); 
                 }
@@ -1573,11 +1590,14 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
         });
         
         bool first = true;
+        int total_latent_frames = 0;
+        size_t total_samples_emitted = 0;
         
         while (true) {
             int want = first ? cfg_.first_chunk_frames : cfg_.max_chunk_frames;
             
             std::vector<Tensor> batch;
+            bool is_final = false;
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done; });
@@ -1587,9 +1607,13 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                     batch.push_back(std::move(queue.front()));
                     queue.pop_front();
                 }
+                is_final = gen_done && queue.empty();
             }
             
             if (batch.empty()) break;
+            
+            int batch_frames = (int)batch.size();
+            total_latent_frames += batch_frames;
             
             auto lat = Tensor::concat(batch, 1);
             std::vector<Ort::Value> inputs;
@@ -1601,7 +1625,17 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             size_t n = 1;
             for (auto d : shape) n *= d;
             
-            if (!cb(outputs[0].GetTensorData<float>(), n)) {
+            // Trim the final chunk: the streaming Mimi decoder may output extra
+            // samples from convolutional padding. Cap to expected total.
+            if (is_final) {
+                size_t expected_total = (size_t)total_latent_frames * 1920;
+                size_t max_this_chunk = (expected_total > total_samples_emitted) 
+                    ? expected_total - total_samples_emitted : 0;
+                if (n > max_this_chunk) n = max_this_chunk;
+            }
+            total_samples_emitted += n;
+            
+            if (n > 0 && !cb(outputs[0].GetTensorData<float>(), n)) {
                 std::lock_guard<std::mutex> lock(mtx);
                 aborted = true;
                 break;
@@ -2146,8 +2180,8 @@ int main(int argc, char* argv[]) {
                 "  --voices-dir <path>      Voice samples directory (default: voices)\n"
                 "  --tokenizer <path>       Tokenizer path (default: models/tokenizer.model)\n"
                 "  --eos-threshold <float>  EOS detection threshold (default: -4.0)\n"
-                "  --noise-clamp <float>    Noise clamp value (default: 3.0, 0=disabled)\n"
-                "  --eos-extra <int>        Extra frames after EOS (default: 10)\n"
+                "  --noise-clamp <float>    Noise clamp value (default: 0, disabled)\n"
+                "  --eos-extra <int>        Extra frames after EOS (default: -1, auto)\n"
                 "  --first-chunk <int>      Frames in first decode chunk (default: 1)\n"
                 "  --max-chunk <int>        Max frames per decode chunk (default: 15)\n"
                 "  --no-cache               Disable all disk caching (.emb and .kv files)\n"
