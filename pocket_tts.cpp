@@ -5,6 +5,38 @@
 //   cmake -B .build -DCMAKE_BUILD_TYPE=Release
 //   cmake --build .build -j$(nproc)
 
+// ── Platform (must come first — winsock2.h before windows.h) ────────────────
+
+#ifdef _WIN32
+  #ifndef _CRT_SECURE_NO_WARNINGS
+    #define _CRT_SECURE_NO_WARNINGS
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <direct.h>
+  #include <io.h>
+  #include <fcntl.h>
+  #pragma comment(lib, "ws2_32.lib")
+  #define ptt_mkdir(path) _mkdir(path)
+  #define ptt_close closesocket
+  typedef SOCKET ptt_socket_t;
+  typedef int socklen_t;
+  static constexpr ptt_socket_t PTT_INVALID_SOCKET = INVALID_SOCKET;
+  using ssize_t = ptrdiff_t;
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <unistd.h>
+  #define ptt_mkdir(path) mkdir(path, 0755)
+  #define ptt_close close
+  typedef int ptt_socket_t;
+  static constexpr ptt_socket_t PTT_INVALID_SOCKET = -1;
+#endif
+
+#include <sys/stat.h>
+#include <csignal>
+
 // ── External Libraries ──────────────────────────────────────────────────────
 
 #include <onnxruntime_cxx_api.h>
@@ -42,15 +74,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-// ── POSIX ───────────────────────────────────────────────────────────────────
-
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <signal.h>
 
 namespace pocket_tts {
 
@@ -366,11 +389,15 @@ static time_t get_mtime(const std::string& path) {
 
 static bool mkdir_p(const std::string& path) {
     size_t pos = 0;
-    while ((pos = path.find('/', pos + 1)) != std::string::npos) {
+    while (pos < path.size()) {
+        size_t slash = path.find('/', pos + 1);
+        size_t bslash = path.find('\\', pos + 1);
+        pos = std::min(slash, bslash);
+        if (pos == std::string::npos) break;
         std::string sub = path.substr(0, pos);
-        if (!sub.empty()) mkdir(sub.c_str(), 0755);
+        if (!sub.empty()) ptt_mkdir(sub.c_str());
     }
-    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+    return ptt_mkdir(path.c_str()) == 0 || errno == EEXIST;
 }
 
 // Derive cache file path: voices/.cache/{stem}.{ext}
@@ -1653,20 +1680,20 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
 // ════════════════════════════════════════════════════════════════════════════
 
 static std::atomic<bool> g_server_running{true};
-static int g_server_fd = -1;
+static ptt_socket_t g_server_fd = PTT_INVALID_SOCKET;
 
 struct HttpRequest {
     std::string method;
     std::string path;
     std::string body;
     
-    static HttpRequest parse(int client_fd) {
+    static HttpRequest parse(ptt_socket_t client_fd) {
         HttpRequest req;
         std::string data;
         char buf[4096];
         
         while (true) {
-            ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+            ssize_t n = recv(client_fd, buf, (int)sizeof(buf), 0);
             if (n <= 0) break;
             data.append(buf, n);
             
@@ -1681,7 +1708,7 @@ struct HttpRequest {
                     size_t body_start = header_end + 4;
                     
                     while (data.size() < body_start + content_length) {
-                        n = recv(client_fd, buf, sizeof(buf), 0);
+                        n = recv(client_fd, buf, (int)sizeof(buf), 0);
                         if (n <= 0) break;
                         data.append(buf, n);
                     }
@@ -1730,30 +1757,40 @@ static std::string json_get_string(const std::string& json, const std::string& k
 class TTSServer {
     PocketTTS& tts_;
     int port_;
-    int server_fd_ = -1;
+    ptt_socket_t server_fd_ = PTT_INVALID_SOCKET;
     std::mutex tts_mutex_;
     
 public:
     TTSServer(PocketTTS& tts, int port) : tts_(tts), port_(port) {}
     
     ~TTSServer() {
-        if (server_fd_ >= 0 && server_fd_ == g_server_fd) {
-            close(server_fd_);
-            g_server_fd = -1;
+        if (server_fd_ != PTT_INVALID_SOCKET && server_fd_ == g_server_fd) {
+            ptt_close(server_fd_);
+            g_server_fd = PTT_INVALID_SOCKET;
         }
-        server_fd_ = -1;
+        server_fd_ = PTT_INVALID_SOCKET;
+#ifdef _WIN32
+        WSACleanup();
+#endif
     }
     
     bool start() {
+#ifdef _WIN32
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            std::cerr << "WSAStartup failed\n";
+            return false;
+        }
+#endif
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0) {
+        if (server_fd_ == PTT_INVALID_SOCKET) {
             std::cerr << "Failed to create socket\n";
             return false;
         }
         g_server_fd = server_fd_;
         
         int opt = 1;
-        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
         
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -1785,21 +1822,30 @@ public:
             sockaddr_in client_addr{};
             socklen_t client_len = sizeof(client_addr);
             
-            int client_fd = accept(server_fd_, (sockaddr*)&client_addr, &client_len);
-            if (client_fd < 0) break;
+            ptt_socket_t client_fd = accept(server_fd_, (sockaddr*)&client_addr, &client_len);
+            if (client_fd == PTT_INVALID_SOCKET) break;
             
+#ifdef _WIN32
+            DWORD tv = 30000;  // milliseconds
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
             struct timeval tv;
             tv.tv_sec = 30;
             tv.tv_usec = 0;
             setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
             
             handle_request(client_fd);
-            close(client_fd);
+            ptt_close(client_fd);
         }
     }
     
 private:
-    void send_response(int fd, int status, const std::string& content_type, const std::string& body) {
+    static void ptt_send(ptt_socket_t fd, const void* data, size_t len) {
+        send(fd, static_cast<const char*>(data), static_cast<int>(len), 0);
+    }
+    
+    void send_response(ptt_socket_t fd, int status, const std::string& content_type, const std::string& body) {
         std::string status_text = (status == 200) ? "OK" : (status == 404) ? "Not Found" : "Bad Request";
         std::ostringstream resp;
         resp << "HTTP/1.1 " << status << " " << status_text << "\r\n";
@@ -1812,10 +1858,10 @@ private:
         resp << body;
         
         std::string data = resp.str();
-        send(fd, data.c_str(), data.size(), 0);
+        ptt_send(fd, data.c_str(), data.size());
     }
     
-    void send_binary_response(int fd, const std::string& content_type, const std::vector<uint8_t>& body) {
+    void send_binary_response(ptt_socket_t fd, const std::string& content_type, const std::vector<uint8_t>& body) {
         std::ostringstream resp;
         resp << "HTTP/1.1 200 OK\r\n";
         resp << "Content-Type: " << content_type << "\r\n";
@@ -1825,8 +1871,8 @@ private:
         resp << "\r\n";
         
         std::string header = resp.str();
-        send(fd, header.c_str(), header.size(), 0);
-        send(fd, body.data(), body.size(), 0);
+        ptt_send(fd, header.c_str(), header.size());
+        ptt_send(fd, body.data(), body.size());
     }
     
     // Encode float PCM samples as a WAV file in memory
@@ -1857,7 +1903,7 @@ private:
         return buf;
     }
     
-    void send_chunked_header(int fd, const std::string& content_type) {
+    void send_chunked_header(ptt_socket_t fd, const std::string& content_type) {
         std::ostringstream resp;
         resp << "HTTP/1.1 200 OK\r\n";
         resp << "Content-Type: " << content_type << "\r\n";
@@ -1866,22 +1912,22 @@ private:
         resp << "\r\n";
         
         std::string data = resp.str();
-        send(fd, data.c_str(), data.size(), 0);
+        ptt_send(fd, data.c_str(), data.size());
     }
     
-    void send_chunk(int fd, const void* data, size_t len) {
+    void send_chunk(ptt_socket_t fd, const void* data, size_t len) {
         char size_buf[32];
         snprintf(size_buf, sizeof(size_buf), "%zx\r\n", len);
-        send(fd, size_buf, strlen(size_buf), 0);
-        send(fd, data, len, 0);
-        send(fd, "\r\n", 2, 0);
+        ptt_send(fd, size_buf, strlen(size_buf));
+        ptt_send(fd, data, len);
+        ptt_send(fd, "\r\n", 2);
     }
     
-    void send_final_chunk(int fd) {
-        send(fd, "0\r\n\r\n", 5, 0);
+    void send_final_chunk(ptt_socket_t fd) {
+        ptt_send(fd, "0\r\n\r\n", 5);
     }
     
-    void handle_request(int client_fd) {
+    void handle_request(ptt_socket_t client_fd) {
         auto req = HttpRequest::parse(client_fd);
         
         char client_ip[INET_ADDRSTRLEN];
@@ -2147,9 +2193,9 @@ void ptt_stream_end(void* stream_ctx) {
 static void signal_handler(int sig) {
     (void)sig;
     pocket_tts::g_server_running = false;
-    if (pocket_tts::g_server_fd >= 0) {
-        close(pocket_tts::g_server_fd);
-        pocket_tts::g_server_fd = -1;
+    if (pocket_tts::g_server_fd != PTT_INVALID_SOCKET) {
+        ptt_close(pocket_tts::g_server_fd);
+        pocket_tts::g_server_fd = PTT_INVALID_SOCKET;
     }
     std::cout << "\nShutting down...\n";
 }
@@ -2264,6 +2310,9 @@ int main(int argc, char* argv[]) {
             double first_chunk_latency = 0;
             
             if (stdout_output) {
+#ifdef _WIN32
+                _setmode(_fileno(stdout), _O_BINARY);
+#endif
                 size_t total_samples = 0;
                 bool first = true;
                 tts.stream(text, voice, [&](const float* s, size_t n) {

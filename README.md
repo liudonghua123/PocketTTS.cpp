@@ -19,7 +19,7 @@ One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 
 - CMake 3.28+
 - C++17 compiler (GCC, Clang)
-- Linux or macOS (Windows support in CMakeLists.txt but untested)
+- Linux, macOS, or Windows
 
 All dependencies (ONNX Runtime, SentencePiece, dr_wav) are fetched automatically by CMake.
 
@@ -145,6 +145,7 @@ To disable caching entirely, pass `--no-cache`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-h`, `--help` | — | Show usage and all options |
 | `--precision` | `int8` | Model precision (`int8` or `fp32`) |
 | `--temperature` | `0.7` | Sampling temperature |
 | `--lsd-steps` | `1` | Flow matching ODE solver steps |

@@ -125,6 +125,8 @@ target_link_libraries(pocket-tts PRIVATE
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pocket-tts PRIVATE pthread dl)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_link_libraries(pocket-tts PRIVATE ws2_32)
 endif()
 
 # Copy ONNX runtime shared library next to outputs
@@ -163,6 +165,8 @@ if(BUILD_SHARED_LIB)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(pocket-tts-lib PRIVATE pthread dl)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        target_link_libraries(pocket-tts-lib PRIVATE ws2_32)
     endif()
 
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
