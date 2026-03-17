@@ -728,6 +728,29 @@ struct StateBufferIO {
     int out_buf() const { return 1 - current_buf; }
     void swap() { current_buf = 1 - current_buf; }
     
+    // Reset all state buffers to zero without freeing/reallocating.
+    // Ideal for fixed-size state models (e.g. Mimi decoder) where the
+    // buffer sizes never change between runs.
+    void reset() {
+        current_buf = 0;
+        size_t n = names.size();
+        for (size_t i = 0; i < n; ++i) {
+            for (int b = 0; b < 2; ++b) {
+                if (is_dynamic[i]) {
+                    // Dynamic states: clear to zero length (keeps capacity)
+                    f32[b][i].clear();
+                    i64[b][i].clear();
+                    b8[b][i].clear();
+                } else {
+                    // Fixed states: zero in place, no allocation
+                    std::fill(f32[b][i].begin(), f32[b][i].end(), 0.0f);
+                    std::fill(i64[b][i].begin(), i64[b][i].end(), int64_t(0));
+                    std::fill(b8[b][i].begin(), b8[b][i].end(), uint8_t(0));
+                }
+            }
+        }
+    }
+    
     Ort::Value create_input_value(size_t state_idx, Ort::MemoryInfo& mem) {
         int b = in_buf();
         auto t = types[state_idx];
@@ -763,21 +786,21 @@ struct StateBufferIO {
     void copy_from_output(size_t state_idx, Ort::Value& val) {
         int b = out_buf();
         auto info = val.GetTensorTypeAndShapeInfo();
-        auto out_shape = info.GetShape();
+        shapes[state_idx] = info.GetShape();
         size_t out_size = info.GetElementCount();
         
-        shapes[state_idx] = out_shape;
-        
+        // Use assign() instead of resize()+memcpy() — avoids copying old buffer
+        // contents when reallocation is needed (resize copies then memcpy overwrites).
         auto t = types[state_idx];
         if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-            i64[b][state_idx].resize(out_size);
-            if (out_size > 0) memcpy(i64[b][state_idx].data(), val.GetTensorData<int64_t>(), out_size * sizeof(int64_t));
+            auto* src = val.GetTensorData<int64_t>();
+            i64[b][state_idx].assign(src, src + out_size);
         } else if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) {
-            b8[b][state_idx].resize(out_size);
-            if (out_size > 0) memcpy(b8[b][state_idx].data(), val.GetTensorData<bool>(), out_size);
+            auto* src = reinterpret_cast<const uint8_t*>(val.GetTensorData<bool>());
+            b8[b][state_idx].assign(src, src + out_size);
         } else {
-            f32[b][state_idx].resize(out_size);
-            if (out_size > 0) memcpy(f32[b][state_idx].data(), val.GetTensorData<float>(), out_size * sizeof(float));
+            auto* src = val.GetTensorData<float>();
+            f32[b][state_idx].assign(src, src + out_size);
         }
     }
     
@@ -877,17 +900,13 @@ struct StateBufferIO {
         shapes = snap.shapes;
         
         for (size_t i = 0; i < n; ++i) {
-            size_t f32_count = snap.f32_offsets[i + 1] - snap.f32_offsets[i];
-            size_t i64_count = snap.i64_offsets[i + 1] - snap.i64_offsets[i];
-            size_t b8_count = snap.b8_offsets[i + 1] - snap.b8_offsets[i];
+            size_t f32_off = snap.f32_offsets[i], f32_end = snap.f32_offsets[i + 1];
+            size_t i64_off = snap.i64_offsets[i], i64_end = snap.i64_offsets[i + 1];
+            size_t b8_off  = snap.b8_offsets[i],  b8_end  = snap.b8_offsets[i + 1];
             
-            f32[b][i].resize(f32_count);
-            i64[b][i].resize(i64_count);
-            b8[b][i].resize(b8_count);
-            
-            if (f32_count) memcpy(f32[b][i].data(), snap.f32_data.data() + snap.f32_offsets[i], f32_count * sizeof(float));
-            if (i64_count) memcpy(i64[b][i].data(), snap.i64_data.data() + snap.i64_offsets[i], i64_count * sizeof(int64_t));
-            if (b8_count) memcpy(b8[b][i].data(), snap.b8_data.data() + snap.b8_offsets[i], b8_count);
+            f32[b][i].assign(snap.f32_data.begin() + f32_off, snap.f32_data.begin() + f32_end);
+            i64[b][i].assign(snap.i64_data.begin() + i64_off, snap.i64_data.begin() + i64_end);
+            b8[b][i].assign(snap.b8_data.begin() + b8_off, snap.b8_data.begin() + b8_end);
         }
     }
     
@@ -957,11 +976,18 @@ struct StateBufferIO {
             read(&type, 4);
             read(&data_bytes, 8);
             if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-                size_t count = data_bytes / 8; i64[b][i].resize(count); read(i64[b][i].data(), data_bytes);
+                size_t count = data_bytes / 8;
+                auto* src = reinterpret_cast<const int64_t*>(p);
+                i64[b][i].assign(src, src + count);
+                p += data_bytes;
             } else if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) {
-                b8[b][i].resize(data_bytes); read(b8[b][i].data(), data_bytes);
+                b8[b][i].assign(p, p + data_bytes);
+                p += data_bytes;
             } else {
-                size_t count = data_bytes / 4; f32[b][i].resize(count); read(f32[b][i].data(), data_bytes);
+                size_t count = data_bytes / 4;
+                auto* src = reinterpret_cast<const float*>(p);
+                f32[b][i].assign(src, src + count);
+                p += data_bytes;
             }
         }
     }
@@ -994,9 +1020,18 @@ public:
     void restore_from_disk(const DiskSnapshot& ds) { state_.restore_from_disk(ds); }
     DiskSnapshot snapshot_to_disk(const Snapshot& snap) const { return state_.snapshot_to_disk(snap); }
     
+    // Full re-initialization — creates fresh StateBufferIO from session metadata.
+    // Required for models with dynamic states (e.g. main transformer KV cache)
+    // where shapes change between runs.
     void reinit() {
         state_ = StateBufferIO();
         state_.init(sess_);
+    }
+    
+    // Lightweight reset — zeroes existing buffers without reallocation.
+    // Only safe for models with fixed-size states (e.g. Mimi decoder).
+    void reset_state() {
+        state_.reset();
     }
     
     std::vector<Ort::Value> run(const std::vector<Ort::Value>& non_state_inputs) {
@@ -1099,9 +1134,22 @@ public:
             return opts;
         };
         
+        // Decoder session gets arena disabled — it's created/reset per sentence
+        // during streaming, and the arena never releases memory back to the OS,
+        // causing unbounded growth under sustained server load.
+        auto make_opts_no_arena = [](int threads) {
+            Ort::SessionOptions opts;
+            opts.SetIntraOpNumThreads(threads);
+            opts.SetInterOpNumThreads(1);
+            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            opts.DisableMemPattern();
+            opts.DisableCpuMemArena();
+            return opts;
+        };
+        
         auto opts_full = make_opts(threads_full);
         auto opts_ar = make_opts(threads_ar);
-        auto opts_dec = make_opts(threads_dec);
+        auto opts_dec = make_opts_no_arena(threads_dec);
         
         if (cfg_.verbose) {
             std::cout << "\n========== ONNX RUNTIME INFO ==========\n";
@@ -1127,6 +1175,7 @@ public:
         dec_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_decoder" + sfx + ".onnx", opts_dec, "mimi_decoder" + sfx);
         
         main_runner_ = std::make_unique<StatefulRunner>(*main_);
+        dec_runner_ = std::make_unique<StatefulRunner>(*dec_);
         
         dt_ = 1.0f / cfg_.lsd_steps;
         st_values_.reserve(cfg_.lsd_steps);
@@ -1298,6 +1347,7 @@ private:
     std::unique_ptr<OrtSession> enc_, txt_, main_, flow_, dec_;
     std::unique_ptr<Tokenizer> tok_;
     std::unique_ptr<StatefulRunner> main_runner_;
+    std::unique_ptr<StatefulRunner> dec_runner_;  // reused across stream() calls
     std::vector<std::pair<float, float>> st_values_;
     float dt_;
     std::unordered_map<std::string, Tensor> vcache_;
@@ -1662,7 +1712,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
         auto [prepared, eos_extra] = prepare_text(sentences[si], cfg_.eos_extra_frames);
         if (prepared.empty()) continue;
         auto gen = make_gen(voice, tokenize(prepared), max_frames, eos_extra);
-        StatefulRunner dec_runner(*dec_);
+        dec_runner_->reset_state();  // zero existing buffers, no reallocation
         
         // Pipelined: generator thread produces latent frames into a queue,
         // decoder (main thread) consumes them in chunks. The two ONNX sessions
@@ -1716,10 +1766,10 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             
             auto lat = Tensor::concat(batch, 1);
             std::vector<Ort::Value> inputs;
-            inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner.mem(), lat.ptr(), lat.numel(),
+            inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner_->mem(), lat.ptr(), lat.numel(),
                                                               lat.shape.data(), lat.shape.size()));
             
-            auto outputs = dec_runner.run(inputs);
+            auto outputs = dec_runner_->run(inputs);
             auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
             size_t n = 1;
             for (auto d : shape) n *= d;
@@ -1924,17 +1974,21 @@ private:
     }
     
     void send_binary_response(ptt_socket_t fd, const std::string& content_type, const std::vector<uint8_t>& body) {
+        send_binary_response(fd, content_type, body.data(), body.size());
+    }
+    
+    void send_binary_response(ptt_socket_t fd, const std::string& content_type, const void* data, size_t len) {
         std::ostringstream resp;
         resp << "HTTP/1.1 200 OK\r\n";
         resp << "Content-Type: " << content_type << "\r\n";
-        resp << "Content-Length: " << body.size() << "\r\n";
+        resp << "Content-Length: " << len << "\r\n";
         resp << "Access-Control-Allow-Origin: *\r\n";
         resp << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
         resp << "\r\n";
         
         std::string header = resp.str();
         ptt_send(fd, header.c_str(), header.size());
-        ptt_send(fd, body.data(), body.size());
+        ptt_send(fd, data, len);
     }
     
     // Encode float PCM samples as a WAV file in memory
@@ -2087,9 +2141,8 @@ private:
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
                 
                 if (format == "pcm") {
-                    std::vector<uint8_t> pcm(audio.samples.size() * sizeof(float));
-                    memcpy(pcm.data(), audio.samples.data(), pcm.size());
-                    send_binary_response(client_fd, "audio/pcm", pcm);
+                    send_binary_response(client_fd, "audio/pcm",
+                        audio.samples.data(), audio.samples.size() * sizeof(float));
                 } else {
                     auto wav = wav_encode(audio.samples.data(), audio.samples.size(), PocketTTS::SR);
                     send_binary_response(client_fd, "audio/wav", wav);
