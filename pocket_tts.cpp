@@ -678,6 +678,7 @@ struct StateBufferIO {
     std::vector<std::vector<int64_t>> i64[2];
     std::vector<std::vector<uint8_t>> b8[2];
     std::vector<std::vector<int64_t>> shapes;
+    std::vector<std::vector<int64_t>> init_shapes;  // original shapes from model metadata (for KV slice restore)
     std::vector<ONNXTensorElementDataType> types;
     std::vector<std::string> names;
     std::vector<bool> is_dynamic;
@@ -722,6 +723,8 @@ struct StateBufferIO {
                 }
             }
         }
+        
+        init_shapes = shapes;
     }
     
     int in_buf() const { return current_buf; }
@@ -860,12 +863,46 @@ struct StateBufferIO {
         Snapshot snap;
         int b = in_buf();
         size_t n = names.size();
-        snap.shapes = shapes;
+        snap.shapes.resize(n);
         snap.current_buf = current_buf;
         
+        // Detect sliceable KV cache states: large float32 buffers with a 1000-dim,
+        // paired with an int64 position counter two states later.
+        // Pattern: state_{3k} = KV [2,1,1000,16,64], state_{3k+1} = empty, state_{3k+2} = counter [1]
+        struct SliceInfo { int seq_dim; int64_t used; };
+        std::vector<SliceInfo> slices(n, {-1, -1});
+        
+        for (size_t i = 0; i < n; ++i) {
+            if (types[i] != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) continue;
+            if (f32[b][i].size() < 100000) continue;
+            
+            int seq_dim = -1;
+            for (size_t d = 0; d < shapes[i].size(); ++d) {
+                if (shapes[i][d] == 1000) { seq_dim = (int)d; break; }
+            }
+            if (seq_dim < 0) continue;
+            
+            // Look for companion int64 counter at i+2
+            if (i + 2 < n && types[i + 2] == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 &&
+                i64[b][i + 2].size() == 1 && i64[b][i + 2][0] > 0 && i64[b][i + 2][0] <= 1000) {
+                slices[i] = {seq_dim, i64[b][i + 2][0]};
+            }
+        }
+        
+        // Compute total sizes with slicing
         size_t total_f32 = 0, total_i64 = 0, total_b8 = 0;
         for (size_t i = 0; i < n; ++i) {
-            total_f32 += f32[b][i].size();
+            if (slices[i].seq_dim >= 0) {
+                auto sh = shapes[i];
+                sh[slices[i].seq_dim] = slices[i].used;
+                snap.shapes[i] = sh;
+                size_t numel = 1;
+                for (auto d : sh) numel *= (d > 0 ? d : 1);
+                total_f32 += numel;
+            } else {
+                snap.shapes[i] = shapes[i];
+                total_f32 += f32[b][i].size();
+            }
             total_i64 += i64[b][i].size();
             total_b8 += b8[b][i].size();
         }
@@ -882,7 +919,28 @@ struct StateBufferIO {
             snap.f32_offsets[i] = fo;
             snap.i64_offsets[i] = io;
             snap.b8_offsets[i] = bo;
-            if (!f32[b][i].empty()) { memcpy(snap.f32_data.data() + fo, f32[b][i].data(), f32[b][i].size() * sizeof(float)); fo += f32[b][i].size(); }
+            
+            if (slices[i].seq_dim >= 0) {
+                // Strided slice copy along the sequence dimension
+                int sd = slices[i].seq_dim;
+                int64_t N = slices[i].used;
+                int64_t outer = 1;
+                for (int d = 0; d < sd; ++d) outer *= shapes[i][d];
+                int64_t inner = 1;
+                for (size_t d = sd + 1; d < shapes[i].size(); ++d) inner *= shapes[i][d];
+                int64_t old_stride = shapes[i][sd] * inner;
+                int64_t new_stride = N * inner;
+                
+                const float* src = f32[b][i].data();
+                float* dst = snap.f32_data.data() + fo;
+                for (int64_t o = 0; o < outer; ++o) {
+                    memcpy(dst + o * new_stride, src + o * old_stride, new_stride * sizeof(float));
+                }
+                fo += outer * new_stride;
+            } else {
+                if (!f32[b][i].empty()) { memcpy(snap.f32_data.data() + fo, f32[b][i].data(), f32[b][i].size() * sizeof(float)); fo += f32[b][i].size(); }
+            }
+            
             if (!i64[b][i].empty()) { memcpy(snap.i64_data.data() + io, i64[b][i].data(), i64[b][i].size() * sizeof(int64_t)); io += i64[b][i].size(); }
             if (!b8[b][i].empty()) { memcpy(snap.b8_data.data() + bo, b8[b][i].data(), b8[b][i].size()); bo += b8[b][i].size(); }
         }
@@ -897,17 +955,51 @@ struct StateBufferIO {
         current_buf = snap.current_buf;
         int b = in_buf();
         size_t n = names.size();
-        shapes = snap.shapes;
         
         for (size_t i = 0; i < n; ++i) {
             size_t f32_off = snap.f32_offsets[i], f32_end = snap.f32_offsets[i + 1];
             size_t i64_off = snap.i64_offsets[i], i64_end = snap.i64_offsets[i + 1];
             size_t b8_off  = snap.b8_offsets[i],  b8_end  = snap.b8_offsets[i + 1];
             
-            f32[b][i].assign(snap.f32_data.begin() + f32_off, snap.f32_data.begin() + f32_end);
+            // Check if this state was sliced (snapshot shape differs from model shape)
+            bool sliced = (snap.shapes[i] != init_shapes[i]) && (f32_end > f32_off);
+            
+            if (sliced) {
+                // Allocate full-size buffer, zero-fill, then copy sliced data into front
+                size_t full_size = 1;
+                for (auto d : init_shapes[i]) full_size *= (d > 0 ? d : 1);
+                f32[b][i].assign(full_size, 0.0f);
+                
+                // Find which dimension was sliced
+                int sd = -1;
+                for (size_t d = 0; d < init_shapes[i].size(); ++d) {
+                    if (snap.shapes[i][d] != init_shapes[i][d]) { sd = (int)d; break; }
+                }
+                
+                if (sd >= 0) {
+                    int64_t N = snap.shapes[i][sd];
+                    int64_t outer = 1;
+                    for (int d = 0; d < sd; ++d) outer *= init_shapes[i][d];
+                    int64_t inner = 1;
+                    for (size_t d = sd + 1; d < init_shapes[i].size(); ++d) inner *= init_shapes[i][d];
+                    int64_t full_stride = init_shapes[i][sd] * inner;
+                    int64_t slice_stride = N * inner;
+                    
+                    const float* src = snap.f32_data.data() + f32_off;
+                    float* dst = f32[b][i].data();
+                    for (int64_t o = 0; o < outer; ++o) {
+                        memcpy(dst + o * full_stride, src + o * slice_stride, slice_stride * sizeof(float));
+                    }
+                }
+            } else {
+                f32[b][i].assign(snap.f32_data.begin() + f32_off, snap.f32_data.begin() + f32_end);
+            }
+            
             i64[b][i].assign(snap.i64_data.begin() + i64_off, snap.i64_data.begin() + i64_end);
             b8[b][i].assign(snap.b8_data.begin() + b8_off, snap.b8_data.begin() + b8_end);
         }
+        
+        shapes = init_shapes;
     }
     
     DiskSnapshot snapshot_to_disk(const Snapshot& snap) const {
@@ -971,10 +1063,11 @@ struct StateBufferIO {
             int32_t ndims, type;
             int64_t data_bytes;
             read(&ndims, 4);
-            shapes[i].resize(ndims);
-            read(shapes[i].data(), ndims * 8);
+            std::vector<int64_t> loaded_shape(ndims);
+            read(loaded_shape.data(), ndims * 8);
             read(&type, 4);
             read(&data_bytes, 8);
+            
             if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
                 size_t count = data_bytes / 8;
                 auto* src = reinterpret_cast<const int64_t*>(p);
@@ -984,12 +1077,45 @@ struct StateBufferIO {
                 b8[b][i].assign(p, p + data_bytes);
                 p += data_bytes;
             } else {
-                size_t count = data_bytes / 4;
-                auto* src = reinterpret_cast<const float*>(p);
-                f32[b][i].assign(src, src + count);
-                p += data_bytes;
+                bool sliced = !init_shapes.empty() && loaded_shape != init_shapes[i];
+                
+                if (sliced) {
+                    // Allocate full-size buffer, zero-fill, copy sliced data into front
+                    size_t full_size = 1;
+                    for (auto d : init_shapes[i]) full_size *= (d > 0 ? d : 1);
+                    f32[b][i].assign(full_size, 0.0f);
+                    
+                    int sd = -1;
+                    for (size_t d = 0; d < init_shapes[i].size(); ++d) {
+                        if (loaded_shape[d] != init_shapes[i][d]) { sd = (int)d; break; }
+                    }
+                    
+                    if (sd >= 0) {
+                        int64_t N = loaded_shape[sd];
+                        int64_t outer = 1;
+                        for (int d = 0; d < sd; ++d) outer *= init_shapes[i][d];
+                        int64_t inner = 1;
+                        for (size_t d = sd + 1; d < init_shapes[i].size(); ++d) inner *= init_shapes[i][d];
+                        int64_t full_stride = init_shapes[i][sd] * inner;
+                        int64_t slice_stride = N * inner;
+                        
+                        const float* src = reinterpret_cast<const float*>(p);
+                        float* dst = f32[b][i].data();
+                        for (int64_t o = 0; o < outer; ++o) {
+                            memcpy(dst + o * full_stride, src + o * slice_stride, slice_stride * sizeof(float));
+                        }
+                    }
+                    p += data_bytes;
+                } else {
+                    size_t count = data_bytes / 4;
+                    auto* src = reinterpret_cast<const float*>(p);
+                    f32[b][i].assign(src, src + count);
+                    p += data_bytes;
+                }
             }
         }
+        
+        shapes = init_shapes;
     }
 };
 
@@ -1372,14 +1498,19 @@ private:
     }
     
     // ── Tokenization ────────────────────────────────────────────────────────
-    // Caller must pass text through prepare_text() first.
     
     TensorI64 tokenize(const std::string& text) {
         auto _ = g_prof.time("tokenize");
-        if (text.empty()) throw std::runtime_error("Empty text");
+        std::string t = text;
+        size_t s = t.find_first_not_of(" \t\n\r");
+        size_t e = t.find_last_not_of(" \t\n\r");
+        if (s == std::string::npos) throw std::runtime_error("Empty text");
+        t = t.substr(s, e - s + 1);
+        if (std::isalnum((unsigned char)t.back())) t += ".";
+        if (!t.empty() && std::islower((unsigned char)t[0])) t[0] = std::toupper((unsigned char)t[0]);
         
-        auto ids = tok_->encode(text);
-        if (cfg_.verbose) std::cerr << "  Tokens: " << ids.size() << " from " << text.size() << " chars\n";
+        auto ids = tok_->encode(t);
+        if (cfg_.verbose) std::cerr << "  Tokens: " << ids.size() << " from " << t.size() << " chars\n";
         TensorI64 r({1, int64_t(ids.size())});
         for (size_t i = 0; i < ids.size(); ++i) r.data[i] = ids[i];
         return r;
