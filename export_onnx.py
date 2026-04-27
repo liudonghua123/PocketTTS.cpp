@@ -1200,6 +1200,12 @@ def main():
                         help=f"Max KV cache length for flow_lm (default: {MAX_SEQ_LEN})")
     parser.add_argument("--config", default=None,
                         help="Path to config YAML (default: use built-in b6369a24)")
+    parser.add_argument("--download-base", default=None,
+                        help="Base URL for downloading weights and tokenizer")
+    parser.add_argument("--weights-url", default=None,
+                        help="Direct download URL for the safetensors weights file")
+    parser.add_argument("--tokenizer-url", default=None,
+                        help="Direct download URL for the tokenizer.model file")
     parser.add_argument("--validate-only", action="store_true",
                         help="Skip export/quantize, only validate existing ONNX files")
     parser.add_argument("--no-validate", action="store_true",
@@ -1233,23 +1239,27 @@ def main():
             if total:
                 print()
 
+    download_base = args.download_base.rstrip("/") if args.download_base else HF_BASE
+    weights_url = args.weights_url or f"{download_base}/tts_b6369a24.safetensors"
+    tokenizer_url = args.tokenizer_url or f"{download_base}/tokenizer.model"
+
     # Download weights (cached, only needed for export)
     weights_file = cache_dir / "tts_b6369a24.safetensors"
     if not weights_file.exists():
         print("\nDownloading weights...")
-        _download(f"{HF_BASE}/tts_b6369a24.safetensors", weights_file)
+        _download(weights_url, weights_file)
         print(f"  ✓ {weights_file}")
 
     # Download tokenizer (needed at runtime)
     tokenizer_file = output_dir / "tokenizer.model"
     if not tokenizer_file.exists():
         print("Downloading tokenizer...")
-        _download(f"{HF_BASE}/tokenizer.model", tokenizer_file)
+        _download(tokenizer_url, tokenizer_file)
         print(f"  ✓ {tokenizer_file}")
 
     # Build config pointing at local weights
     import pocket_tts as _ptt
-    config_path = Path(_ptt.__file__).parent / "config" / "b6369a24.yaml"
+    config_path = Path(_ptt.__file__).parent / "config" / "english_2026-01.yaml"
     if args.config:
         config_path = Path(args.config)
     config = load_config(config_path)

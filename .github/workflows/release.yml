@@ -1,0 +1,96 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Release name'
+        required: false
+      build_type:
+        description: 'CMake build type'
+        required: false
+        default: 'Release'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            sudo apt-get update -y
+            sudo apt-get install -y cmake build-essential
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            brew install cmake || true
+          fi
+        shell: bash
+
+      - name: Configure project
+        run: cmake -B .build -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }}
+        shell: bash
+
+      - name: Build project
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cmake --build .build --config ${{ github.event.inputs.build_type }} --parallel
+          else
+            cmake --build .build --parallel
+          fi
+        shell: bash
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install pocket-tts huggingface-hub
+
+      - name: Export ONNX models
+        run: python export_onnx.py
+
+      - name: Download voices
+        run: python download_voices.py
+
+      - name: Package release asset
+        run: |
+          mkdir -p release
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp pocket-tts.exe release/ || true
+            cp onnxruntime.dll release/ || true
+            cp libpocket_tts.dll release/ || true
+            cp README.md LICENSE release/
+            pushd release
+            python -m zipfile -c ../pockettts-${{ matrix.os }}-${{ github.run_number }}.zip ./*
+            popd
+            python -m zipfile -c release/models-${{ github.run_number }}.zip models/ || true
+            python -m zipfile -c release/voices-${{ github.run_number }}.zip voices/ || true
+          else
+            cp pocket-tts release/ || true
+            cp libonnxruntime.so release/ || true
+            cp libonnxruntime.dylib release/ || true
+            cp libpocket_tts.so release/ || true
+            cp libpocket_tts.dylib release/ || true
+            cp README.md LICENSE release/
+            tar -C release -czf release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
+            tar -czf release/models-${{ github.run_number }}.tar.gz models/ || true
+            tar -czf release/voices-${{ github.run_number }}.tar.gz voices/ || true
+          fi
+        shell: bash
+
+      - name: Create GitHub release and upload asset
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "release-${{ github.run_number }}"
+          name: "${{ github.event.inputs.release_name || format('PocketTTS Release #%s', github.run_number) }}"
+          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}"
+          allow_updates: true
