@@ -17,6 +17,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -35,13 +36,13 @@ jobs:
         shell: bash
 
       - name: Configure project
-        run: cmake -B .build -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }}
+        run: cmake -B .build -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type || 'RelWithDebInfo' }}
         shell: bash
 
       - name: Build project
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cmake --build .build --config ${{ github.event.inputs.build_type }} --parallel
+            cmake --build .build --config "${{ github.event.inputs.build_type || 'RelWithDebInfo' }}" --parallel 2 --verbose
           else
             cmake --build .build --parallel
           fi
@@ -92,5 +93,5 @@ jobs:
         with:
           tag: "release-${{ github.run_number }}"
           name: "${{ github.event.inputs.release_name || format('PocketTTS Release #%s', github.run_number) }}"
-          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}"
+          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }},release/models-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }},release/voices-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}"
           allow_updates: true
