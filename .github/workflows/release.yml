@@ -1,0 +1,120 @@
+name: Build and release
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Release name'
+        required: false
+        default: 'latest build'
+      build_type:
+        description: 'CMake build type'
+        required: false
+        default: 'Release'
+
+permissions: write-all
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            sudo apt-get update -y
+            sudo apt-get install -y cmake build-essential
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            brew install cmake || true
+          fi
+        shell: bash
+
+      - name: Configure project
+        run: cmake -B .build -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type || 'RelWithDebInfo' }}
+        shell: bash
+
+      - name: Build project
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cmake --build .build --config "${{ github.event.inputs.build_type || 'RelWithDebInfo' }}" --parallel 2 --verbose
+          else
+            cmake --build .build --parallel
+          fi
+        shell: bash
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install huggingface-hub
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts.git"
+          pip install onnx onnxruntime
+
+      - name: Export ONNX models
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: |
+          python export_onnx.py
+          echo "export_onnx.py exit code: $?"
+
+      - name: Download voices
+        if: matrix.os == 'ubuntu-latest'
+        run: python download_voices.py
+
+      - name: Package release asset
+        run: |
+          mkdir -p release
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            [[ -f pocket-tts.exe ]] && cp pocket-tts.exe release/
+            [[ -f onnxruntime.dll ]] && cp onnxruntime.dll release/
+            [[ -f libpocket_tts.dll ]] && cp libpocket_tts.dll release/
+            cp README.md LICENSE release/
+            tar -C release -czf pockettts-${{ matrix.os }}.tar.gz .
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            [[ -f pocket-tts ]] && cp pocket-tts release/
+            [[ -f libonnxruntime.so ]] && cp libonnxruntime.so release/
+            [[ -f libonnxruntime.dylib ]] && cp libonnxruntime.dylib release/
+            [[ -f libpocket_tts.so ]] && cp libpocket_tts.so release/
+            [[ -f libpocket_tts.dylib ]] && cp libpocket_tts.dylib release/
+            cp README.md LICENSE release/
+            tar -C release -czf pockettts-${{ matrix.os }}.tar.gz .
+            if [[ -d models ]]; then
+              tar -czf models.tar.gz --exclude='.cache' models/
+            fi
+            if [[ -d voices ]]; then
+              tar -czf voices.tar.gz --exclude='.cache' voices/
+            fi
+          else
+            [[ -f pocket-tts ]] && cp pocket-tts release/
+            [[ -f libonnxruntime.dylib ]] && cp libonnxruntime.dylib release/
+            [[ -f libpocket_tts.dylib ]] && cp libpocket_tts.dylib release/
+            cp README.md LICENSE release/
+            tar -C release -czf pockettts-${{ matrix.os }}.tar.gz .
+          fi
+        shell: bash
+
+      - name: Publish binary to release
+        continue-on-error: true
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: latest
+          release_name: ${{ github.event.inputs.release_name || 'latest build' }}
+          files: |
+            pockettts-${{ matrix.os }}.tar.gz
+            models.tar.gz
+            voices.tar.gz
+          draft: false
+          prerelease: false

@@ -57,6 +57,20 @@ models/
 └── tokenizer.model
 ```
 
+You can also download the weights and tokenizer from a custom source such as Hugging Face or ModelScope:
+
+```bash
+python export_onnx.py --download-base https://huggingface.co/YourRepo/resolve/main
+```
+
+Or specify explicit download URLs:
+
+```bash
+python export_onnx.py \
+  --weights-url https://huggingface.co/YourRepo/resolve/main/tts_b6369a24.safetensors \
+  --tokenizer-url https://huggingface.co/YourRepo/resolve/main/tokenizer.model
+```
+
 ### Directory Structure
 
 ```
@@ -187,6 +201,13 @@ To disable caching entirely, pass `--no-cache`.
 
 - [Kyutai Labs](https://github.com/kyutai-labs/pocket-tts) — Pocket TTS model and original Python implementation (MIT)
 - [Verylicious/pocket-tts-ungated](https://huggingface.co/Verylicious/pocket-tts-ungated) — Ungated model weights and tokenizer (CC-BY-4.0)
+
+## Release Workflow
+
+A GitHub Actions workflow is included at `.github/workflows/release.yml`.
+It supports manual triggering, building the project on Linux, macOS, and Windows, packaging the compiled runtime without model weights, and uploading release assets to GitHub Releases.
+
+To run the workflow manually, open the Actions tab and choose `Build and release`, then provide a release name.
 
 ## License
 
