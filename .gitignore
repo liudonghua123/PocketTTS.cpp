@@ -1,0 +1,57 @@
+# Build outputs
+.build/
+build/
+CMakeFiles/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Build artifacts
+moss-tts-nano
+moss-tts-nano.exe
+
+# CMake
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# models and voices
+models/
+voices/
+
+# Generated files
+*.wav
+output.wav
+test_out.wav
+debug.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.DS_Store?
+._*
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+*.log
+
+# Cache
+*.pyc
+__pycache__/
+.cache/
+
+# Distribution
+*.tar.gz
+*.zip
+dist/
