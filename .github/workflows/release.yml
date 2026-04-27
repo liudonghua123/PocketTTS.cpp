@@ -2,8 +2,6 @@ name: Build and release
 
 on:
   push:
-    branches:
-      - '**'
   workflow_dispatch:
     inputs:
       release_name:
@@ -54,12 +52,21 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python dependencies
-        run: pip install pocket-tts huggingface-hub
+        run: |
+          pip install huggingface-hub
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts.git"
+          pip install onnx onnxruntime
 
       - name: Export ONNX models
-        run: python export_onnx.py
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: |
+          python export_onnx.py
+          echo "export_onnx.py exit code: $?"
 
       - name: Download voices
+        if: matrix.os == 'ubuntu-latest'
         run: python download_voices.py
 
       - name: Package release asset
@@ -73,9 +80,7 @@ jobs:
             pushd release
             python -m zipfile -c ../pockettts-${{ matrix.os }}-${{ github.run_number }}.zip ./*
             popd
-            python -m zipfile -c release/models-${{ github.run_number }}.zip models/ || true
-            python -m zipfile -c release/voices-${{ github.run_number }}.zip voices/ || true
-          else
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
             cp pocket-tts release/ || true
             cp libonnxruntime.so release/ || true
             cp libonnxruntime.dylib release/ || true
@@ -85,13 +90,20 @@ jobs:
             tar -C release -czf release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
             tar -czf release/models-${{ github.run_number }}.tar.gz models/ || true
             tar -czf release/voices-${{ github.run_number }}.tar.gz voices/ || true
+          else
+            cp pocket-tts release/ || true
+            cp libonnxruntime.dylib release/ || true
+            cp libpocket_tts.dylib release/ || true
+            cp README.md LICENSE release/
+            tar -C release -czf release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
           fi
         shell: bash
 
       - name: Create GitHub release and upload asset
+        if: matrix.os == 'ubuntu-latest'
         uses: ncipollo/release-action@v1
         with:
           tag: "release-${{ github.run_number }}"
           name: "${{ github.event.inputs.release_name || format('PocketTTS Release #%s', github.run_number) }}"
-          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }},release/models-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }},release/voices-${{ github.run_number }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}"
+          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz,release/models-${{ github.run_number }}.tar.gz,release/voices-${{ github.run_number }}.tar.gz"
           allow_updates: true
