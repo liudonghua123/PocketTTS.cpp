@@ -7,10 +7,13 @@ on:
       release_name:
         description: 'Release name'
         required: false
+        default: 'daily build'
       build_type:
         description: 'CMake build type'
         required: false
         default: 'Release'
+
+permissions: write-all
 
 jobs:
   build:
@@ -73,29 +76,33 @@ jobs:
         run: |
           mkdir -p release
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp pocket-tts.exe release/ || true
-            cp onnxruntime.dll release/ || true
-            cp libpocket_tts.dll release/ || true
+            [[ -f pocket-tts.exe ]] && cp pocket-tts.exe release/
+            [[ -f onnxruntime.dll ]] && cp onnxruntime.dll release/
+            [[ -f libpocket_tts.dll ]] && cp libpocket_tts.dll release/
             cp README.md LICENSE release/
             pushd release
             python -m zipfile -c ../pockettts-${{ matrix.os }}-${{ github.run_number }}.zip ./*
             popd
           elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            cp pocket-tts release/ || true
-            cp libonnxruntime.so release/ || true
-            cp libonnxruntime.dylib release/ || true
-            cp libpocket_tts.so release/ || true
-            cp libpocket_tts.dylib release/ || true
+            [[ -f pocket-tts ]] && cp pocket-tts release/
+            [[ -f libonnxruntime.so ]] && cp libonnxruntime.so release/
+            [[ -f libonnxruntime.dylib ]] && cp libonnxruntime.dylib release/
+            [[ -f libpocket_tts.so ]] && cp libpocket_tts.so release/
+            [[ -f libpocket_tts.dylib ]] && cp libpocket_tts.dylib release/
             cp README.md LICENSE release/
-            tar -C release -czf release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
-            tar -czf release/models-${{ github.run_number }}.tar.gz models/ || true
-            tar -czf release/voices-${{ github.run_number }}.tar.gz voices/ || true
+            tar -C release -czf pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
+            if [[ -d models ]]; then
+              tar -czf models-${{ github.run_number }}.tar.gz models/
+            fi
+            if [[ -d voices ]]; then
+              tar -czf voices-${{ github.run_number }}.tar.gz voices/
+            fi
           else
-            cp pocket-tts release/ || true
-            cp libonnxruntime.dylib release/ || true
-            cp libpocket_tts.dylib release/ || true
+            [[ -f pocket-tts ]] && cp pocket-tts release/
+            [[ -f libonnxruntime.dylib ]] && cp libonnxruntime.dylib release/
+            [[ -f libpocket_tts.dylib ]] && cp libpocket_tts.dylib release/
             cp README.md LICENSE release/
-            tar -C release -czf release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
+            tar -C release -czf pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz .
           fi
         shell: bash
 
@@ -105,5 +112,5 @@ jobs:
         with:
           tag: "release-${{ github.run_number }}"
           name: "${{ github.event.inputs.release_name || format('PocketTTS Release #%s', github.run_number) }}"
-          files: "release/pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz,release/models-${{ github.run_number }}.tar.gz,release/voices-${{ github.run_number }}.tar.gz"
+          files: "pockettts-${{ matrix.os }}-${{ github.run_number }}.tar.gz,models-${{ github.run_number }}.tar.gz,voices-${{ github.run_number }}.tar.gz"
           allow_updates: true
