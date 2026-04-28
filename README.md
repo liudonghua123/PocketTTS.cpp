@@ -17,7 +17,26 @@ Complete C++ implementation of MOSS-TTS-Nano-100M using ONNX Runtime.
 
 ## Quick Start
 
-### Building
+### Automated Setup (Recommended)
+
+```bash
+# Run the setup script
+./setup-moss-tts.sh
+
+# Or with custom directories
+./setup-moss-tts.sh --models-dir /path/to/models --voices-dir /path/to/voices
+```
+
+This will:
+1. Check dependencies
+2. Build the binary if needed
+3. Download models from HuggingFace
+4. Create test voice samples
+5. Run validation tests
+
+### Manual Setup
+
+#### Building
 
 ```bash
 # Create build directory
@@ -44,38 +63,21 @@ cmake --build .build -j$(nproc)
 
 ## Model Setup
 
-### Download Models
+### Automatic (Recommended)
+
+Use the setup script:
+```bash
+./setup-moss-tts.sh
+```
+
+### Manual Download
 
 ```bash
-# Using huggingface-cli
-huggingface-cli download OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX --local-dir models/
-huggingface-cli download OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX --local-dir models/
-```
+# Download using the download script
+python3 download_models.py --models-dir models
 
-### Expected Model Structure
-
-```
-models/
-├── text_encoder.onnx          # Text → embeddings
-├── audio_encoder.onnx         # Audio (reference) → conditioning
-├── ar_model.onnx              # Autoregressive backbone
-├── ar_model_int8.onnx         # INT8 quantized version
-├── flow_model.onnx            # Flow matching network
-├── flow_model_int8.onnx       # INT8 quantized version
-├── decoder.onnx               # Latent codes → audio
-├── decoder_int8.onnx          # INT8 quantized version
-└── tokenizer.model            # SentencePiece tokenizer
-```
-
-### Voice Samples
-
-Place reference voice samples in `voices/` directory:
-
-```
-voices/
-├── speaker1.wav
-├── speaker2.wav
-└── speaker3.wav
+# Or verify existing models
+python3 download_models.py --verify
 ```
 
 ## Architecture
@@ -117,6 +119,19 @@ Expected performance on modern CPUs:
 | Number of Layers | 4 |
 | Attention Heads | 8 |
 | Max Sequence Length | 1000 |
+
+### Supported Model Naming
+
+The code supports flexible model naming for compatibility with different ONNX model sources:
+
+| Function | Standard Name | Alternative Name |
+|----------|---------------|------------------|
+| Text Encoding | `text_encoder.onnx` | `text_conditioner.onnx` |
+| Audio Encoding | `audio_encoder.onnx` | `mimi_encoder.onnx` |
+| Autoregressive | `ar_model[_int8].onnx` | `flow_lm_main[_int8].onnx` |
+| Flow Matching | `flow_model[_int8].onnx` | `flow_lm_flow[_int8].onnx` |
+| Audio Decoding | `decoder[_int8].onnx` | `mimi_decoder[_int8].onnx` |
+| Tokenization | `tokenizer.model` | (SentencePiece format) |
 
 ## Command Line Options
 

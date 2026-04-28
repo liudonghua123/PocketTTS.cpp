@@ -2,7 +2,29 @@
 
 Complete step-by-step guide for building and running MOSS-TTS-Nano.cpp.
 
-## Table of Contents
+## Quick Setup
+
+For a fast automatic setup, use the provided setup script:
+
+```bash
+# Run complete setup (build + download models + test)
+./setup-moss-tts.sh
+
+# Or with custom directories
+./setup-moss-tts.sh --models-dir /path/to/models --voices-dir /path/to/voices
+
+# Skip testing
+./setup-moss-tts.sh --skip-test
+```
+
+The setup script will:
+- Verify Python and build tools
+- Build the binary if needed
+- Download all required models
+- Create test voice samples
+- Run end-to-end validation
+
+For manual setup, follow the instructions below.
 
 1. [Prerequisites](#prerequisites)
 2. [Linux Installation](#linux-installation)
@@ -162,15 +184,31 @@ cmake --build .build -j %NUMBER_OF_PROCESSORS%
 
 ## Model Setup
 
-### 1. Create Model Directory
+### 1. Automatic Download (Recommended)
+
+```bash
+# Using the download script
+python3 download_models.py
+
+# Or to a custom location
+python3 download_models.py --models-dir /path/to/models
+```
+
+### 2. Create Model Directory
 
 ```bash
 mkdir -p models
 ```
 
-### 2. Download Models from HuggingFace
+### 3. Download Models from HuggingFace
 
-**Option A: Using huggingface-cli**
+**Option A: Using the provided Python script**
+
+```bash
+python3 download_models.py --models-dir models -v
+```
+
+**Option B: Using huggingface-cli**
 
 ```bash
 # Install huggingface-hub
@@ -187,26 +225,35 @@ huggingface-cli download \
   --local-dir models/
 ```
 
-**Option B: Manual Download**
+**Option C: Manual Download**
 
 1. Visit [MOSS-TTS-Nano-100M-ONNX](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX)
 2. Download each `.onnx` file to `models/`
 3. Download `tokenizer.model` to `models/`
 
-### 3. Verify Model Structure
+### 4. Verify Model Structure
 
-```bash
-ls -la models/
-# Expected files:
-# - text_encoder.onnx (or similar name)
-# - audio_encoder.onnx
-# - ar_model.onnx / ar_model_int8.onnx
-# - flow_model.onnx / flow_model_int8.onnx
-# - decoder.onnx / decoder_int8.onnx
-# - tokenizer.model
+The code supports multiple naming schemes for compatibility:
+
+```
+models/
+├── text_encoder.onnx or text_conditioner.onnx
+├── audio_encoder.onnx or mimi_encoder.onnx
+├── ar_model.onnx or flow_lm_main.onnx
+├── ar_model_int8.onnx or flow_lm_main_int8.onnx (optional)
+├── flow_model.onnx or flow_lm_flow.onnx
+├── flow_model_int8.onnx or flow_lm_flow_int8.onnx (optional)
+├── decoder.onnx or mimi_decoder.onnx
+├── decoder_int8.onnx or mimi_decoder_int8.onnx (optional)
+└── tokenizer.model
 ```
 
-### 4. Prepare Voice Samples
+Verify your setup:
+```bash
+python3 download_models.py --verify
+```
+
+### 5. Prepare Voice Samples
 
 ```bash
 # Create voices directory
@@ -221,11 +268,31 @@ mkdir -p voices
 Create or download sample voices:
 
 ```bash
-# Generate test voice (using sox if available)
-sox -r 22050 -n voices/test.wav synth 2 sine 440 vol 0.1
+# Generate test voice (using Python)
+python3 << 'EOF'
+import struct, math
 
-# Or download from voice libraries
-# (Google Colab notebooks often have examples)
+# Generate sine wave
+sr, dur, freq = 22050, 2, 440
+samples = [math.sin(2*math.pi*freq*i/sr)*0.1 for i in range(int(sr*dur))]
+
+# Write WAV
+with open('voices/test.wav', 'wb') as f:
+    f.write(b'RIFF')
+    f.write(struct.pack('<I', 36+len(samples)*4))
+    f.write(b'WAVE' + b'fmt ')
+    f.write(struct.pack('<IHHIIHH', 16, 3, 1, sr, sr*4, 4, 32))
+    f.write(b'data' + struct.pack('<I', len(samples)*4))
+    for s in samples:
+        f.write(struct.pack('<f', s))
+EOF
+
+# Or if you have ffmpeg
+ffmpeg -f lavfi -i "sine=frequency=440:duration=2" \
+       -ar 22050 -q:a 9 voices/test.wav
+
+# Or if you have sox
+sox -r 22050 -n voices/test.wav synth 2 sine 440 vol 0.1
 ```
 
 ## Verification
@@ -236,9 +303,8 @@ sox -r 22050 -n voices/test.wav synth 2 sine 440 vol 0.1
 # Show help
 ./moss-tts-nano --help
 
-# Test with sample text (create dummy audio first)
-sox -r 22050 -n models/test.wav synth 1 sine 440 vol 0.05
-./moss-tts-nano "Hello world" models/test.wav test_output.wav
+# Test with sample text
+./moss-tts-nano --verbose "Hello, MOSS-TTS-Nano!" voices/test.wav test_output.wav --threads 1
 
 # Check output
 file test_output.wav
@@ -246,16 +312,19 @@ file test_output.wav
 
 ### Verify Audio Output
 
-```bash
-# Using sox
-sox test_output.wav -n stat
-sox test_output.wav -n remix - | head
+Using Python:
+```python
+import struct
 
-# Using ffprobe (if installed)
-ffprobe test_output.wav
+with open('test_output.wav', 'rb') as f:
+    # Read RIFF header
+    riff = f.read(4)
+    size = struct.unpack('<I', f.read(4))[0]
+    fmt = f.read(4)
+    print(f"Format: {fmt.decode()}, Size: {size} bytes")
 
-# Using Python
-python3 -c "import soundfile as sf; x, sr = sf.read('test_output.wav'); print(f'Duration: {len(x)/sr:.2f}s, SR: {sr}')"
+# Or with ffprobe (if installed)
+# ffprobe test_output.wav
 ```
 
 ## Building from Source with Options
@@ -331,9 +400,31 @@ cmake --build .build
 
 ## Troubleshooting
 
-### Build Errors
+### Setup Script Issues
 
-**CMake not found**
+**"setup-moss-tts.sh: command not found"**
+```bash
+# Make script executable
+chmod +x setup-moss-tts.sh
+
+# Or run with bash directly
+bash setup-moss-tts.sh
+```
+
+**"Python3 not found"**
+```bash
+# Install Python
+sudo apt-get install python3        # Ubuntu/Debian
+brew install python3                # macOS
+choco install python                # Windows
+```
+
+**Script hangs during download**
+- Check internet connection
+- Try downloading models manually: `python3 download_models.py -v`
+- Check disk space: `df -h`
+
+### Model Loading Issues
 ```bash
 # Install CMake
 sudo apt-get install cmake          # Ubuntu
