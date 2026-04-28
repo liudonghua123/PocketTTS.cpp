@@ -186,6 +186,18 @@ static Ort::Env& get_ort_env() {
     return env;
 }
 
+static std::string find_model_file(const std::string& models_dir, 
+                                    const std::vector<std::string>& candidates) {
+    for (const auto& name : candidates) {
+        std::string path = models_dir + "/" + name;
+        std::ifstream f(path);
+        if (f.good()) return path;
+    }
+    
+    // Return first candidate path (original behavior)
+    return models_dir + "/" + candidates[0];
+}
+
 static std::basic_string<ORTCHAR_T> to_ort_path(const std::string& s) {
 #ifdef _WIN32
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -332,17 +344,31 @@ public:
         try {
             std::string sfx = (cfg_.precision == "int8") ? "_int8" : "";
             
-            // Load MOSS models
-            text_encoder_ = std::make_unique<OrtSession>(env, 
-                cfg_.models_dir + "/text_encoder.onnx", opts, "text_encoder");
-            audio_encoder_ = std::make_unique<OrtSession>(env,
-                cfg_.models_dir + "/audio_encoder.onnx", opts, "audio_encoder");
-            ar_model_ = std::make_unique<OrtSession>(env,
-                cfg_.models_dir + "/ar_model" + sfx + ".onnx", opts, "ar_model");
-            flow_model_ = std::make_unique<OrtSession>(env,
-                cfg_.models_dir + "/flow_model" + sfx + ".onnx", opts, "flow_model");
-            decoder_ = std::make_unique<OrtSession>(env,
-                cfg_.models_dir + "/decoder" + sfx + ".onnx", opts, "decoder");
+            // Load MOSS models with fallback names
+            // text_encoder variants: text_encoder.onnx, text_conditioner.onnx
+            std::string text_enc_path = find_model_file(cfg_.models_dir, 
+                {"text_encoder.onnx", "text_conditioner.onnx"});
+            text_encoder_ = std::make_unique<OrtSession>(env, text_enc_path, opts, "text_encoder");
+            
+            // audio_encoder variants: audio_encoder.onnx, mimi_encoder.onnx
+            std::string audio_enc_path = find_model_file(cfg_.models_dir,
+                {"audio_encoder.onnx", "mimi_encoder.onnx"});
+            audio_encoder_ = std::make_unique<OrtSession>(env, audio_enc_path, opts, "audio_encoder");
+            
+            // AR model variants: ar_model[_int8].onnx, flow_lm_main[_int8].onnx
+            std::string ar_path = find_model_file(cfg_.models_dir,
+                {"ar_model" + sfx + ".onnx", "ar_model.onnx", "flow_lm_main" + sfx + ".onnx", "flow_lm_main.onnx"});
+            ar_model_ = std::make_unique<OrtSession>(env, ar_path, opts, "ar_model");
+            
+            // Flow model variants: flow_model[_int8].onnx, flow_lm_flow[_int8].onnx
+            std::string flow_path = find_model_file(cfg_.models_dir,
+                {"flow_model" + sfx + ".onnx", "flow_model.onnx", "flow_lm_flow" + sfx + ".onnx", "flow_lm_flow.onnx"});
+            flow_model_ = std::make_unique<OrtSession>(env, flow_path, opts, "flow_model");
+            
+            // Decoder variants: decoder[_int8].onnx, mimi_decoder[_int8].onnx
+            std::string decoder_path = find_model_file(cfg_.models_dir,
+                {"decoder" + sfx + ".onnx", "decoder.onnx", "mimi_decoder" + sfx + ".onnx", "mimi_decoder.onnx"});
+            decoder_ = std::make_unique<OrtSession>(env, decoder_path, opts, "decoder");
             
             if (cfg_.verbose) {
                 std::cout << "\n  Models loaded successfully:\n";
