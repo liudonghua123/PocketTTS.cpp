@@ -437,12 +437,13 @@ public:
         
         // Try WAV first
         unsigned int channels = 0, sample_rate = 0;
+        drwav_uint64 frame_count = 0;
         float* data = drwav_open_file_and_read_pcm_frames_f32(
-            path.c_str(), &channels, &sample_rate, nullptr);
+            path.c_str(), &channels, &sample_rate, &frame_count, nullptr);
         
         if (data) {
             audio.sample_rate = sample_rate;
-            audio.samples.assign(data, data + sample_rate);
+            audio.samples.assign(data, data + frame_count);
             drwav_free(data, nullptr);
             return audio;
         }
@@ -454,21 +455,22 @@ public:
     }
     
     static bool save_audio(const AudioData& audio, const std::string& path) {
-        drwav cfg = {};
-        cfg.container = drwav_container_riff;
-        cfg.format = DR_WAVE_FORMAT_IEEE_FLOAT;
-        cfg.channels = 1;
-        cfg.sampleRate = audio.sample_rate;
-        cfg.bitsPerSample = 32;
+        drwav_data_format format = {};
+        format.container = drwav_container_riff;
+        format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+        format.channels = 1;
+        format.sampleRate = audio.sample_rate;
+        format.bitsPerSample = 32;
         
-        if (!drwav_init_file_write(&cfg, path.c_str(), nullptr)) {
+        drwav wav = {};
+        if (!drwav_init_file_write(&wav, path.c_str(), &format, nullptr)) {
             std::cerr << "Failed to create output file: " << path << "\n";
             return false;
         }
         
         drwav_uint64 written = drwav_write_pcm_frames(
-            &cfg, audio.samples.size(), audio.samples.data());
-        drwav_uninit(&cfg);
+            &wav, audio.samples.size(), audio.samples.data());
+        drwav_uninit(&wav);
         
         return written == (drwav_uint64)audio.samples.size();
     }
