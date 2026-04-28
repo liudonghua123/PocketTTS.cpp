@@ -11,6 +11,8 @@ CMakeFiles/
 # Build artifacts
 moss-tts-nano
 moss-tts-nano.exe
+sentencepiece
+spm_*
 
 # CMake
 CMakeCache.txt
